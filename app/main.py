@@ -118,7 +118,8 @@ def main() -> int:
     txt_fh = open(args.save_txt, "a", encoding="utf-8") if args.save_txt else None
     wav_chunks: List[np.ndarray] = []
     recent_output = ""
-    last_commit_abs = 0.0
+    last_commit_sec = 0.0
+    captured_audio_sec = 0.0
 
     try:
         capture.start()
@@ -134,6 +135,7 @@ def main() -> int:
                     wav_chunks.append(chunk.data.copy())
                 mono16 = resample_audio(chunk.data, chunk.sample_rate, 16000)
                 buffer.append(mono16)
+                captured_audio_sec += len(mono16) / 16000.0
 
             if stop:
                 break
@@ -143,27 +145,26 @@ def main() -> int:
                 continue
 
             segs = whisper.transcribe(window_audio, language=args.language)
-            now = time.time()
-            window_start_abs = now - args.window_sec
+            window_start_sec = max(0.0, captured_audio_sec - (len(window_audio) / 16000.0))
 
             for seg in segs:
-                abs_start = window_start_abs + seg.start
-                abs_end = window_start_abs + seg.end
-                if abs_end > now - args.commit_delay_sec:
+                rel_start = window_start_sec + seg.start
+                rel_end = window_start_sec + seg.end
+                if rel_end > captured_audio_sec - args.commit_delay_sec:
                     continue
-                if abs_end <= last_commit_abs:
+                if rel_end <= last_commit_sec:
                     continue
                 delta = merge_with_recent(recent_output[-120:], seg.text)
                 if not delta:
                     continue
 
-                line = f"[{abs_start:8.2f}-{abs_end:8.2f}] {delta}"
+                line = f"[{rel_start:8.2f}-{rel_end:8.2f}] {delta}"
                 console.print(line)
                 if txt_fh:
                     txt_fh.write(line + "\n")
                     txt_fh.flush()
                 recent_output += " " + delta
-                last_commit_abs = abs_end
+                last_commit_sec = rel_end
 
     except Exception as e:
         console.print("[red]エラーが発生しました。[/red]")
