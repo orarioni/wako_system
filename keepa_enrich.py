@@ -1,14 +1,20 @@
+import configparser
+import logging
 import os
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from statistics import median
 from typing import Any
 
 import pandas as pd
 import requests
 
-INPUT_FILE = "output.xlsx"
-OUTPUT_FILE = "output_keepa.xlsx"
-KEEPA_DOMAIN = 5  # Amazon.co.jp
+DEFAULT_KEEPA_DOMAIN = 5  # Amazon.co.jp
+DEFAULT_TIMEOUT_SEC = 30
+DEFAULT_INPUT_FILE = "output.xlsx"
+DEFAULT_OUTPUT_FILE = "output_keepa.xlsx"
+DEFAULT_LOG_FILE = "keepa_enrich.log"
 KEEPA_EPOCH = datetime(2011, 1, 1, tzinfo=timezone.utc)
 
 ADDED_COLUMNS = [
@@ -24,10 +30,27 @@ ADDED_COLUMNS = [
 ]
 
 
+def get_base_dir() -> Path:
+    """Resolve the directory of script/executable for portable file handling."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
 def normalize_asin(value: Any) -> str:
     if pd.isna(value):
         return ""
     return str(value).strip()
+
+
+def safe_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(number):
+        return None
+    return number
 
 
 def keepa_minutes_to_datetime_str(minutes: Any) -> str | None:
@@ -43,7 +66,44 @@ def keepa_minutes_to_datetime_str(minutes: Any) -> str | None:
     return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def fetch_keepa_product(asin: str, api_key: str, domain: int = KEEPA_DOMAIN) -> dict[str, Any]:
+def load_settings(base_dir: Path) -> dict[str, Any]:
+    """Load config.ini values with safe defaults."""
+    config = configparser.ConfigParser()
+    config_path = base_dir / "config.ini"
+    config.read(config_path, encoding="utf-8")
+
+    settings = {
+        "api_key": config.get("keepa", "api_key", fallback="").strip(),
+        "input_excel": config.get("files", "input_excel", fallback=DEFAULT_INPUT_FILE).strip() or DEFAULT_INPUT_FILE,
+        "output_excel": config.get("files", "output_excel", fallback=DEFAULT_OUTPUT_FILE).strip() or DEFAULT_OUTPUT_FILE,
+        "log_file": config.get("app", "log_file", fallback=DEFAULT_LOG_FILE).strip() or DEFAULT_LOG_FILE,
+        "timeout_sec": config.getint("app", "timeout_sec", fallback=DEFAULT_TIMEOUT_SEC),
+    }
+
+    settings["input_path"] = (base_dir / settings["input_excel"]).resolve()
+    settings["output_path"] = (base_dir / settings["output_excel"]).resolve()
+    settings["log_path"] = (base_dir / settings["log_file"]).resolve()
+    settings["config_path"] = config_path
+    return settings
+
+
+def configure_logging(log_path: Path) -> logging.Logger:
+    logger = logging.getLogger("keepa_enrich")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    return logger
+
+
+def fetch_keepa_product(asin: str, api_key: str, timeout_sec: int, domain: int = DEFAULT_KEEPA_DOMAIN) -> dict[str, Any]:
     url = "https://api.keepa.com/product"
     params = {
         "key": api_key,
@@ -53,13 +113,16 @@ def fetch_keepa_product(asin: str, api_key: str, domain: int = KEEPA_DOMAIN) -> 
         "history": 0,
         "buybox": 0,
     }
-    response = requests.get(url, params=params, timeout=30)
+    response = requests.get(url, params=params, timeout=timeout_sec)
     response.raise_for_status()
     payload = response.json()
 
+    if payload.get("tokensLeft") is not None and payload.get("tokensLeft") <= 0:
+        raise ValueError("Keepa API tokensLeft is 0")
+
     products = payload.get("products") or []
     if not products:
-        raise ValueError("Keepa response does not include product data")
+        raise ValueError("Keepa response has no product")
 
     product = products[0]
     stats = product.get("stats") or {}
@@ -73,46 +136,47 @@ def fetch_keepa_product(asin: str, api_key: str, domain: int = KEEPA_DOMAIN) -> 
     }
 
 
-def collect_keepa_data(asins: list[str], api_key: str) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+def collect_keepa_data(
+    asins: list[str],
+    api_key: str,
+    timeout_sec: int,
+    logger: logging.Logger,
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Fetch Keepa data by unique ASIN. Keep processing even if a subset fails."""
     data: dict[str, dict[str, Any]] = {}
     errors: dict[str, str] = {}
 
-    for asin in asins:
+    for index, asin in enumerate(asins, start=1):
         try:
-            data[asin] = fetch_keepa_product(asin=asin, api_key=api_key)
-        except Exception as exc:  # noqa: BLE001 - individual ASIN failures should not stop processing
-            errors[asin] = str(exc)
+            data[asin] = fetch_keepa_product(asin=asin, api_key=api_key, timeout_sec=timeout_sec)
+            logger.info("[%s/%s] Keepa fetched: %s", index, len(asins), asin)
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc)
+            errors[asin] = message
+            logger.warning("[%s/%s] Keepa fetch failed: %s (%s)", index, len(asins), asin, message)
 
     return data, errors
 
 
 def calculate_coefficient(keepa_data: dict[str, dict[str, Any]]) -> float:
+    """Median(monthlySold/salesRankDrops30) where both are >=1, fallback is 1.0."""
     ratios: list[float] = []
 
     for item in keepa_data.values():
-        monthly = item.get("monthlySold")
-        drops30 = item.get("salesRankDrops30")
-        if monthly is None or drops30 in (None, 0):
+        monthly = safe_float(item.get("monthlySold"))
+        drops30 = safe_float(item.get("salesRankDrops30"))
+        if monthly is None or drops30 is None:
             continue
-        try:
-            monthly_f = float(monthly)
-            drops30_f = float(drops30)
-        except (TypeError, ValueError):
+        if monthly < 1 or drops30 < 1:
             continue
-        if drops30_f <= 0:
-            continue
-        ratios.append(monthly_f / drops30_f)
+        ratios.append(monthly / drops30)
 
     if not ratios:
         return 1.0
     return float(median(ratios))
 
 
-def build_estimation(
-    asin: str,
-    keepa_info: dict[str, Any] | None,
-    coefficient: float,
-) -> dict[str, Any]:
+def build_estimation(asin: str, keepa_info: dict[str, Any] | None, coefficient: float) -> dict[str, Any]:
     if not asin:
         return {
             "keepa_title": None,
@@ -142,19 +206,16 @@ def build_estimation(
     monthly = keepa_info.get("monthlySold")
     drops30 = keepa_info.get("salesRankDrops30")
 
-    if monthly is not None:
-        try:
-            estimated = int(round(float(monthly)))
-        except (TypeError, ValueError):
-            estimated = monthly
+    monthly_f = safe_float(monthly)
+    drops30_f = safe_float(drops30)
+
+    if monthly_f is not None and monthly_f >= 1:
+        estimated = int(round(monthly_f))
         source = "monthlySold"
         confidence = "A"
         note = "Keepa monthlySold を採用"
-    elif drops30 is not None:
-        try:
-            estimated = int(round(float(drops30) * coefficient))
-        except (TypeError, ValueError):
-            estimated = None
+    elif drops30_f is not None and drops30_f >= 1:
+        estimated = int(round(drops30_f * coefficient))
         source = "salesRankDrops30_calibrated"
         confidence = "B"
         note = "salesRankDrops30 × 補正係数で推定"
@@ -188,52 +249,76 @@ def enrich_dataframe(df: pd.DataFrame, keepa_data: dict[str, dict[str, Any]], co
     return df
 
 
-def print_summary(df: pd.DataFrame, keepa_data: dict[str, dict[str, Any]], errors: dict[str, str], coefficient: float) -> None:
+def log_and_print_summary(
+    df: pd.DataFrame,
+    keepa_data: dict[str, dict[str, Any]],
+    errors: dict[str, str],
+    coefficient: float,
+    logger: logging.Logger,
+) -> None:
     asin_series = df["ASIN"].apply(normalize_asin)
     non_empty_asins = asin_series[asin_series != ""]
-
-    print("=== Keepa Enrich Summary ===")
-    print(f"Input rows: {len(df)}")
-    print(f"Rows with ASIN: {len(non_empty_asins)}")
-    print(f"Unique ASIN requested: {non_empty_asins.nunique()}")
-    print(f"Keepa fetch success: {len(keepa_data)}")
-    print(f"Keepa fetch failed: {len(errors)}")
-    print(f"Calibration coefficient: {coefficient:.6f}")
-
     source_counts = df["estimate_source"].value_counts(dropna=False).to_dict()
-    print(f"Estimate source breakdown: {source_counts}")
+
+    lines = [
+        "=== Keepa Enrich Summary ===",
+        f"Input rows: {len(df)}",
+        f"Rows with ASIN: {len(non_empty_asins)}",
+        f"Unique ASIN requested: {non_empty_asins.nunique()}",
+        f"Keepa fetch success: {len(keepa_data)}",
+        f"Keepa fetch failed: {len(errors)}",
+        f"Calibration coefficient: {coefficient:.6f}",
+        f"Estimate source breakdown: {source_counts}",
+    ]
+
+    for line in lines:
+        logger.info(line)
 
     if errors:
-        print("Failed ASIN examples:")
-        for asin, message in list(errors.items())[:10]:
-            print(f"- {asin}: {message}")
+        logger.warning("Failed ASIN list (up to 30):")
+        for asin, message in list(errors.items())[:30]:
+            logger.warning("- %s: %s", asin, message)
 
 
 def main() -> None:
-    api_key = os.getenv("KEEPA_API_KEY")
-    if not api_key:
-        raise RuntimeError("環境変数 KEEPA_API_KEY が設定されていません。")
+    base_dir = get_base_dir()
+    settings = load_settings(base_dir)
+    logger = configure_logging(settings["log_path"])
 
-    df = pd.read_excel(INPUT_FILE)
+    api_key = settings["api_key"] or os.getenv("KEEPA_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Keepa APIキーが見つかりません。config.ini の [keepa] api_key または環境変数 KEEPA_API_KEY を設定してください。")
+
+    logger.info("Base directory: %s", base_dir)
+    logger.info("Using config file: %s", settings["config_path"])
+    logger.info("Input Excel: %s", settings["input_path"])
+    logger.info("Output Excel: %s", settings["output_path"])
+
+    if not settings["input_path"].exists():
+        raise FileNotFoundError(f"入力ファイルが見つかりません: {settings['input_path']}")
+
+    df = pd.read_excel(settings["input_path"])
     if "ASIN" not in df.columns:
         raise ValueError("入力ファイルに ASIN 列が存在しません。")
 
     asins = (
-        df["ASIN"]
-        .apply(normalize_asin)
-        .loc[lambda s: s != ""]
-        .drop_duplicates()
-        .tolist()
+        df["ASIN"].apply(normalize_asin).loc[lambda s: s != ""].drop_duplicates().tolist()
     )
+    logger.info("Unique ASIN count: %s", len(asins))
 
-    keepa_data, errors = collect_keepa_data(asins=asins, api_key=api_key)
+    keepa_data, errors = collect_keepa_data(
+        asins=asins,
+        api_key=api_key,
+        timeout_sec=settings["timeout_sec"],
+        logger=logger,
+    )
     coefficient = calculate_coefficient(keepa_data)
 
     enriched = enrich_dataframe(df=df, keepa_data=keepa_data, coefficient=coefficient)
-    enriched.to_excel(OUTPUT_FILE, index=False)
+    enriched.to_excel(settings["output_path"], index=False)
 
-    print_summary(enriched, keepa_data, errors, coefficient)
-    print(f"Saved: {OUTPUT_FILE}")
+    log_and_print_summary(enriched, keepa_data, errors, coefficient, logger)
+    logger.info("Saved output: %s", settings["output_path"])
 
 
 if __name__ == "__main__":
