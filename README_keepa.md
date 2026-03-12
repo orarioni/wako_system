@@ -73,25 +73,67 @@ asin_cache = asin_cache.csv
 [app]
 log_file = keepa_enrich.log
 timeout_sec = 30
+
+[run]
+default_mode = single
+reserve_tokens = 10
+tokens_per_minute = 5
+interval_seconds = 60
+max_minutes = 480
 ```
 
 APIキーの優先順:
 1. `config.ini` の `[keepa] api_key`
 2. 環境変数 `KEEPA_API_KEY`
 
+
+## 実行モード（single / burst / drip）
+
+### single
+- 既存の1回実行モードです。
+- 差分更新キューで今回取得対象になったASINを1回で処理して終了します。
+
+### burst
+- 起動時点の `available_tokens` を確認し、`reserve_tokens` を残した範囲で可能なだけ処理します。
+- 予算式: `usable_tokens = max(0, available_tokens - reserve_tokens)`
+- 1 ASIN = 1 token 前提で `usable_tokens` 件までを上限とします。
+- 初回投入や手動で一気に進めたい運用向けです。
+
+### drip
+- 夜間の継続運用向けモードです。
+- `interval_seconds` ごとに token status を見ながら安全な件数だけ進めます。
+- 予算式: `target_tokens_this_cycle = tokens_per_minute * interval_seconds / 60`（整数化）
+- `available_tokens - reserve_tokens` を超えるときは自動で減速します。
+- トークン不足時は 0 件のループを許容し、待機とログを継続します。
+
+### reserve_tokens の意味
+- Keepaトークンを使い切らないための安全余力です。
+- `available_tokens` が `reserve_tokens` 以下なら、その時点の取得件数は 0 になります。
+
+### 途中停止条件
+- `single`: 1回実行で終了
+- `burst`: 予算消化またはキュー消化で終了
+- `drip`: `max_minutes` 到達、`max_fetches` 到達、またはキュー消化で終了
+
 ## 実行方法
 
 ### Python で実行（開発時）
 ```bash
 pip install -r requirements.txt
-python keepa_enrich.py
+python keepa_enrich.py --mode single
+python keepa_enrich.py --mode burst --reserve-tokens 10
+python keepa_enrich.py --mode drip --tokens-per-minute 5 --interval-seconds 60 --max-minutes 480
+python keepa_enrich.py --mode burst --dry-run
 ```
 
 ### 実行ファイル（配布先）
 配布先では `KeepaMonthlySales.exe` と同じフォルダに
 - `config.ini`
 - `output.xlsx`
-を置いて、`run.bat` を実行します。
+を置いて、用途に応じて以下を実行します。
+- `run.bat`（single）
+- `run_burst.bat`（burst）
+- `run_drip.bat`（drip）
 
 ## ローカル Windows での PyInstaller ビルド例
 > Codex 上では exe ビルドせず、以下をローカル Windows で実行してください。
@@ -148,6 +190,18 @@ dist\KeepaMonthlySales\
 - `keepa_product_not_found_count`
 - `monthlySold_missing_count`
 - `salesRankDrops30_missing_count`
+- `mode`
+- `available_tokens_at_start`
+- `reserve_tokens`
+- `total_queue_count`
+- `selected_fetch_count`
+- `remaining_queue_count`
+- `cycle_count`
+- `total_sleep_seconds`
+- `run_duration_seconds`
+- `effective_tokens_per_minute`（drip）
+- `max_minutes_reached`（drip）
+- `queue_exhausted`（drip）
 - `coefficient_value`
 
 ## よくある失敗と対処

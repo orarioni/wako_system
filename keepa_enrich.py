@@ -1,7 +1,9 @@
+import argparse
 import configparser
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
@@ -24,6 +26,13 @@ DEFAULT_INPUT_FILE = "output.xlsx"
 DEFAULT_OUTPUT_FILE = "output_keepa.xlsx"
 DEFAULT_LOG_FILE = "keepa_enrich.log"
 DEFAULT_CACHE_FILE = "asin_cache.csv"
+DEFAULT_MODE = "single"
+DEFAULT_RESERVE_TOKENS = 10
+DEFAULT_TOKENS_PER_MINUTE = 5.0
+DEFAULT_INTERVAL_SECONDS = 60
+DEFAULT_MAX_MINUTES = 480
+DEFAULT_MAX_BATCH_SIZE = 100
+TOKEN_COST_PER_ASIN = 1
 KEEPA_EPOCH = datetime(2011, 1, 1, tzinfo=timezone.utc)
 
 ADDED_COLUMNS = [
@@ -124,6 +133,11 @@ def load_settings(base_dir: Path) -> dict[str, Any]:
         "log_file": config.get("app", "log_file", fallback=DEFAULT_LOG_FILE).strip() or DEFAULT_LOG_FILE,
         "cache_file": config.get("files", "asin_cache", fallback=DEFAULT_CACHE_FILE).strip() or DEFAULT_CACHE_FILE,
         "timeout_sec": config.getint("app", "timeout_sec", fallback=DEFAULT_TIMEOUT_SEC),
+        "default_mode": config.get("run", "default_mode", fallback=DEFAULT_MODE).strip() or DEFAULT_MODE,
+        "reserve_tokens": config.getint("run", "reserve_tokens", fallback=DEFAULT_RESERVE_TOKENS),
+        "tokens_per_minute": config.getfloat("run", "tokens_per_minute", fallback=DEFAULT_TOKENS_PER_MINUTE),
+        "interval_seconds": config.getint("run", "interval_seconds", fallback=DEFAULT_INTERVAL_SECONDS),
+        "max_minutes": config.getint("run", "max_minutes", fallback=DEFAULT_MAX_MINUTES),
     }
 
     settings["input_path"] = (base_dir / settings["input_excel"]).resolve()
@@ -388,10 +402,11 @@ def build_cache_updates(
     valid_asins: list[str],
     rows_seen: dict[str, int],
     fetched_keepa_data: dict[str, dict[str, Any]],
-    fetch_metrics: dict[str, int],
+    fetch_metrics: dict[str, Any],
     existing_cache: pd.DataFrame,
     coefficient: float,
     now: datetime,
+    attempted_asins: set[str],
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     cache_idx = existing_cache.set_index("asin", drop=False) if not existing_cache.empty else pd.DataFrame(columns=["asin"]).set_index("asin", drop=False)
     failure_by_asin = fetch_metrics.get("failure_by_asin", {})
@@ -402,6 +417,7 @@ def build_cache_updates(
 
     for asin in valid_asins:
         old = cache_idx.loc[asin] if asin in cache_idx.index else None
+        attempted = asin in attempted_asins
         failure_type = failure_by_asin.get(asin)
 
         if asin in fetched_keepa_data:
@@ -409,43 +425,55 @@ def build_cache_updates(
             est = build_estimation(asin, keepa_info, coefficient)
             fetched_success_count += 1
             consecutive_failures = 0
+            last_fetched_at = now.strftime("%Y-%m-%d %H:%M:%S")
             last_success_at = now.strftime("%Y-%m-%d %H:%M:%S")
             last_failure_at = old.get("last_failure_at") if old is not None else None
-        else:
-            if failure_type:
-                fetched_failure_count += 1
-                if old is not None:
-                    keepa_info = keepa_row_from_cache(old)
-                    est = build_estimation(asin, keepa_info, coefficient)
-                    if est["estimate_source"] == "unavailable":
-                        est["estimate_note"] = "Keepa data unavailable"
-                else:
-                    est = build_estimation(asin, None, coefficient)
-                previous_failures = int(safe_float(old.get("consecutive_failures")) or 0) if old is not None else 0
-                consecutive_failures = previous_failures + 1
-                last_success_at = old.get("last_success_at") if old is not None else None
-                last_failure_at = now.strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                if old is None:
-                    continue
+            next_fetch_after = compute_next_fetch_after(
+                now=now,
+                failure_type=None,
+                monthly_sold=est["keepa_monthlySold"],
+                drops30=est["keepa_salesRankDrops30"],
+            )
+        elif attempted and failure_type:
+            fetched_failure_count += 1
+            if old is not None:
                 keepa_info = keepa_row_from_cache(old)
                 est = build_estimation(asin, keepa_info, coefficient)
-                failure_type = old.get("failure_type")
-                consecutive_failures = int(safe_float(old.get("consecutive_failures")) or 0)
-                last_success_at = old.get("last_success_at")
-                last_failure_at = old.get("last_failure_at")
-
-        next_fetch_after = compute_next_fetch_after(
-            now=now,
-            failure_type=failure_type,
-            monthly_sold=est["keepa_monthlySold"],
-            drops30=est["keepa_salesRankDrops30"],
-        )
+            else:
+                est = build_estimation(asin, None, coefficient)
+            previous_failures = int(safe_float(old.get("consecutive_failures")) or 0) if old is not None else 0
+            consecutive_failures = previous_failures + 1
+            last_fetched_at = now.strftime("%Y-%m-%d %H:%M:%S")
+            last_success_at = old.get("last_success_at") if old is not None else None
+            last_failure_at = now.strftime("%Y-%m-%d %H:%M:%S")
+            next_fetch_after = compute_next_fetch_after(
+                now=now,
+                failure_type=failure_type,
+                monthly_sold=est["keepa_monthlySold"],
+                drops30=est["keepa_salesRankDrops30"],
+            )
+        else:
+            if old is None:
+                continue
+            keepa_info = keepa_row_from_cache(old)
+            est = build_estimation(asin, keepa_info, coefficient)
+            failure_type = old.get("failure_type")
+            consecutive_failures = int(safe_float(old.get("consecutive_failures")) or 0)
+            last_fetched_at = old.get("last_fetched_at")
+            last_success_at = old.get("last_success_at")
+            last_failure_at = old.get("last_failure_at")
+            next_fetch_after_text = old.get("next_fetch_after")
+            next_fetch_after = pd.to_datetime(next_fetch_after_text).to_pydatetime() if next_fetch_after_text else compute_next_fetch_after(
+                now=now,
+                failure_type=failure_type,
+                monthly_sold=est["keepa_monthlySold"],
+                drops30=est["keepa_salesRankDrops30"],
+            )
 
         updates.append(
             {
                 "asin": asin,
-                "last_fetched_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "last_fetched_at": last_fetched_at,
                 "last_success_at": last_success_at,
                 "last_failure_at": last_failure_at,
                 "keepa_title": est["keepa_title"],
@@ -469,7 +497,7 @@ def build_cache_updates(
     }
 
 
-def build_summary(df: pd.DataFrame, metrics: dict[str, int], coefficient: float) -> dict[str, Any]:
+def build_summary(df: pd.DataFrame, metrics: dict[str, Any], coefficient: float) -> dict[str, Any]:
     asin_series = df["ASIN"].apply(normalize_asin)
     rows_with_missing_asin = int((asin_series == "").sum())
     rows_with_valid_asin = int((asin_series != "").sum())
@@ -496,6 +524,18 @@ def build_summary(df: pd.DataFrame, metrics: dict[str, int], coefficient: float)
         "keepa_product_not_found_count": int(metrics.get("keepa_product_not_found_count", 0)),
         "monthlySold_missing_count": int(metrics.get("monthlySold_missing_count", 0)),
         "salesRankDrops30_missing_count": int(metrics.get("salesRankDrops30_missing_count", 0)),
+        "mode": metrics.get("mode", "single"),
+        "available_tokens_at_start": int(metrics.get("available_tokens_at_start", 0)),
+        "reserve_tokens": int(metrics.get("reserve_tokens", 0)),
+        "total_queue_count": int(metrics.get("total_queue_count", 0)),
+        "selected_fetch_count": int(metrics.get("selected_fetch_count", 0)),
+        "remaining_queue_count": int(metrics.get("remaining_queue_count", 0)),
+        "cycle_count": int(metrics.get("cycle_count", 0)),
+        "total_sleep_seconds": int(metrics.get("total_sleep_seconds", 0)),
+        "run_duration_seconds": int(metrics.get("run_duration_seconds", 0)),
+        "effective_tokens_per_minute": float(metrics.get("effective_tokens_per_minute", 0.0)),
+        "max_minutes_reached": bool(metrics.get("max_minutes_reached", False)),
+        "queue_exhausted": bool(metrics.get("queue_exhausted", False)),
         "coefficient_value": float(coefficient),
     }
 
@@ -509,9 +549,169 @@ def log_and_print_summary(summary: dict[str, Any], logger: logging.Logger) -> No
             logger.info("%s: %s", key, value)
 
 
+def parse_args(settings: dict[str, Any]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Keepa monthly sales enrichment")
+    parser.add_argument("--mode", choices=["single", "burst", "drip"], default=settings["default_mode"])
+    parser.add_argument("--reserve-tokens", type=int, default=settings["reserve_tokens"])
+    parser.add_argument("--tokens-per-minute", type=float, default=settings["tokens_per_minute"])
+    parser.add_argument("--interval-seconds", type=int, default=settings["interval_seconds"])
+    parser.add_argument("--max-minutes", type=int, default=settings["max_minutes"])
+    parser.add_argument("--max-fetches", type=int, default=None)
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args()
+
+
+def get_token_status(api_key: str, timeout_sec: int, logger: logging.Logger) -> int:
+    url = "https://api.keepa.com/token"
+    try:
+        response = requests.get(url, params={"key": api_key}, timeout=timeout_sec)
+        response.raise_for_status()
+        payload = response.json()
+        tokens = payload.get("tokensLeft")
+        if tokens is None:
+            tokens = payload.get("tokensleft")
+        if tokens is None:
+            logger.warning("token_status_unavailable detail=missing_tokens_field")
+            return 0
+        return max(0, int(tokens))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("token_status_unavailable detail=%s", str(exc))
+        return 0
+
+
+def compute_burst_budget(available_tokens: int, reserve_tokens: int, queue_count: int, max_fetches: int | None) -> int:
+    usable_tokens = max(0, available_tokens - reserve_tokens)
+    budget = min(queue_count, usable_tokens // TOKEN_COST_PER_ASIN)
+    if max_fetches is not None:
+        budget = min(budget, max_fetches)
+    return max(0, budget)
+
+
+def compute_drip_budget(
+    available_tokens: int,
+    reserve_tokens: int,
+    tokens_per_minute: float,
+    interval_seconds: int,
+    queue_count: int,
+    max_fetches: int | None,
+) -> int:
+    target_tokens_this_cycle = max(0, int(tokens_per_minute * interval_seconds / 60.0))
+    usable_tokens = max(0, available_tokens - reserve_tokens)
+    budget = min(queue_count, target_tokens_this_cycle, usable_tokens // TOKEN_COST_PER_ASIN, DEFAULT_MAX_BATCH_SIZE)
+    if max_fetches is not None:
+        budget = min(budget, max_fetches)
+    return max(0, budget)
+
+
+def sort_queued_asins(queue_decisions: list[Any]) -> list[str]:
+    priority_rank = {"high": 0, "medium": 1, "low": 2}
+    queued = [d for d in queue_decisions if d.queued]
+    queued.sort(key=lambda d: priority_rank.get(d.priority, 9))
+    return [d.asin for d in queued]
+
+
+def select_fetch_batch(queued_asins: list[str], budget: int, max_batch_size: int = DEFAULT_MAX_BATCH_SIZE) -> list[str]:
+    return queued_asins[: max(0, min(budget, max_batch_size))]
+
+
+def merge_metrics(total: dict[str, Any], part: dict[str, Any]) -> dict[str, Any]:
+    for key, value in part.items():
+        if key == "failure_by_asin":
+            total.setdefault("failure_by_asin", {}).update(value)
+        elif isinstance(value, int):
+            total[key] = int(total.get(key, 0)) + value
+    return total
+
+
+def run_single_mode(queued_asins: list[str], max_fetches: int | None, dry_run: bool) -> tuple[list[str], int, int, bool]:
+    selected = queued_asins if max_fetches is None else queued_asins[:max_fetches]
+    return selected, len(selected), 1, dry_run
+
+
+def run_burst_mode(
+    queued_asins: list[str],
+    reserve_tokens: int,
+    max_fetches: int | None,
+    available_tokens: int,
+    dry_run: bool,
+) -> tuple[list[str], int, int, bool]:
+    budget = compute_burst_budget(available_tokens, reserve_tokens, len(queued_asins), max_fetches)
+    selected = queued_asins[:budget]
+    return selected, budget, 1, dry_run
+
+
+def run_drip_mode(
+    queued_asins: list[str],
+    reserve_tokens: int,
+    tokens_per_minute: float,
+    interval_seconds: int,
+    max_minutes: int,
+    max_fetches: int | None,
+    api_key: str,
+    timeout_sec: int,
+    logger: logging.Logger,
+    dry_run: bool,
+) -> tuple[list[str], int, int, float, bool, bool]:
+    if not queued_asins:
+        return [], 0, 0, 0.0, False, True
+
+    start = time.time()
+    total_sleep_seconds = 0.0
+    cycle_count = 0
+    selected: list[str] = []
+    queue_index = 0
+    max_minutes_reached = False
+
+    while queue_index < len(queued_asins):
+        elapsed_minutes = (time.time() - start) / 60.0
+        if elapsed_minutes >= max_minutes:
+            max_minutes_reached = True
+            break
+
+        cycle_count += 1
+        available_tokens = get_token_status(api_key=api_key, timeout_sec=timeout_sec, logger=logger)
+        remaining_queue = len(queued_asins) - queue_index
+        cycle_budget = compute_drip_budget(
+            available_tokens=available_tokens,
+            reserve_tokens=reserve_tokens,
+            tokens_per_minute=tokens_per_minute,
+            interval_seconds=interval_seconds,
+            queue_count=remaining_queue,
+            max_fetches=None if max_fetches is None else max(0, max_fetches - len(selected)),
+        )
+        batch = select_fetch_batch(queued_asins[queue_index:], cycle_budget)
+        selected.extend(batch)
+        queue_index += len(batch)
+
+        logger.info(
+            "mode=drip cycle=%s available_tokens=%s reserve_tokens=%s cycle_budget=%s selected_fetch_count=%s remaining_queue_count=%s sleep_seconds=%s",
+            cycle_count,
+            available_tokens,
+            reserve_tokens,
+            cycle_budget,
+            len(batch),
+            len(queued_asins) - queue_index,
+            interval_seconds,
+        )
+
+        if queue_index >= len(queued_asins):
+            break
+        if max_fetches is not None and len(selected) >= max_fetches:
+            break
+        if dry_run:
+            break
+
+        time.sleep(interval_seconds)
+        total_sleep_seconds += interval_seconds
+
+    queue_exhausted = queue_index >= len(queued_asins)
+    return selected, len(selected), cycle_count, total_sleep_seconds, max_minutes_reached, queue_exhausted
+
+
 def main() -> None:
     base_dir = get_base_dir()
     settings = load_settings(base_dir)
+    args = parse_args(settings)
     logger = configure_logging(settings["log_path"])
 
     api_key = settings["api_key"] or os.getenv("KEEPA_API_KEY", "").strip()
@@ -523,10 +723,12 @@ def main() -> None:
     logger.info("Input Excel: %s", settings["input_path"])
     logger.info("Output Excel: %s", settings["output_path"])
     logger.info("ASIN cache: %s", settings["cache_path"])
+    logger.info("mode=%s dry_run=%s", args.mode, args.dry_run)
 
     if not settings["input_path"].exists():
         raise FileNotFoundError(f"入力ファイルが見つかりません: {settings['input_path']}")
 
+    run_start = time.time()
     df = pd.read_excel(settings["input_path"])
     if "ASIN" not in df.columns:
         raise ValueError("入力ファイルに ASIN 列が存在しません。")
@@ -538,47 +740,105 @@ def main() -> None:
 
     cache_df = load_cache(settings["cache_path"])
     queue_decisions = decide_fetch_queue(valid_asins=valid_asins, rows_seen=rows_seen, cache=cache_df, now=now)
-    queued_asins = [d.asin for d in queue_decisions if d.queued]
-
     for decision in queue_decisions:
         logger.info("ASIN=%s queue_decision=%s fetch_priority=%s", decision.asin, decision.decision, decision.priority)
 
-    logger.info("Unique valid ASIN count: %s", len(valid_asins))
-    logger.info("Queued ASIN count for API fetch: %s", len(queued_asins))
+    queued_asins = sort_queued_asins(queue_decisions)
+    available_tokens_at_start = get_token_status(api_key=api_key, timeout_sec=settings["timeout_sec"], logger=logger) if args.mode in {"burst", "drip"} else 0
 
-    fetched_keepa_data, fetch_metrics = collect_keepa_data(
-        asins=queued_asins,
-        api_key=api_key,
-        timeout_sec=settings["timeout_sec"],
-        logger=logger,
-    )
+    if args.mode == "single":
+        selected_asins, selected_fetch_count, cycle_count, is_dry = run_single_mode(queued_asins, args.max_fetches, args.dry_run)
+        total_sleep_seconds = 0.0
+        max_minutes_reached = False
+        queue_exhausted = selected_fetch_count >= len(queued_asins)
+    elif args.mode == "burst":
+        selected_asins, selected_fetch_count, cycle_count, is_dry = run_burst_mode(
+            queued_asins=queued_asins,
+            reserve_tokens=args.reserve_tokens,
+            max_fetches=args.max_fetches,
+            available_tokens=available_tokens_at_start,
+            dry_run=args.dry_run,
+        )
+        total_sleep_seconds = 0.0
+        max_minutes_reached = False
+        queue_exhausted = selected_fetch_count >= len(queued_asins)
+        logger.info(
+            "mode=burst available_tokens=%s reserve_tokens=%s cycle_budget=%s selected_fetch_count=%s remaining_queue_count=%s",
+            available_tokens_at_start,
+            args.reserve_tokens,
+            selected_fetch_count,
+            selected_fetch_count,
+            len(queued_asins) - selected_fetch_count,
+        )
+    else:
+        selected_asins, selected_fetch_count, cycle_count, total_sleep_seconds, max_minutes_reached, queue_exhausted = run_drip_mode(
+            queued_asins=queued_asins,
+            reserve_tokens=args.reserve_tokens,
+            tokens_per_minute=args.tokens_per_minute,
+            interval_seconds=args.interval_seconds,
+            max_minutes=args.max_minutes,
+            max_fetches=args.max_fetches,
+            api_key=api_key,
+            timeout_sec=settings["timeout_sec"],
+            logger=logger,
+            dry_run=args.dry_run,
+        )
+        is_dry = args.dry_run
+
+    logger.info("mode=%s selected_fetch_count=%s total_queue_count=%s", args.mode, selected_fetch_count, len(queued_asins))
+
+    fetch_metrics: dict[str, Any] = {
+        "communication_error_count": 0,
+        "keepa_product_not_found_count": 0,
+        "monthlySold_missing_count": 0,
+        "salesRankDrops30_missing_count": 0,
+        "failure_by_asin": {},
+    }
+    fetched_keepa_data: dict[str, dict[str, Any]] = {}
+    attempted_asins: set[str] = set()
+
+    if not is_dry and selected_asins:
+        batches = [selected_asins[i:i + DEFAULT_MAX_BATCH_SIZE] for i in range(0, len(selected_asins), DEFAULT_MAX_BATCH_SIZE)]
+        for batch in batches:
+            attempted_asins.update(batch)
+            batch_data, batch_metrics = collect_keepa_data(
+                asins=batch,
+                api_key=api_key,
+                timeout_sec=settings["timeout_sec"],
+                logger=logger,
+            )
+            fetched_keepa_data.update(batch_data)
+            fetch_metrics = merge_metrics(fetch_metrics, batch_metrics)
+
     keepa_data_from_cache, cache_metrics = build_keepa_data_from_cache(valid_asins=valid_asins, cache_df=cache_df)
     keepa_data = {**keepa_data_from_cache, **fetched_keepa_data}
-
     coefficient = calculate_coefficient(keepa_data)
 
-    cache_updates, fetch_result_metrics = build_cache_updates(
-        valid_asins=valid_asins,
-        rows_seen=rows_seen,
-        fetched_keepa_data=fetched_keepa_data,
-        fetch_metrics=fetch_metrics,
-        existing_cache=cache_df,
-        coefficient=coefficient,
-        now=now,
-    )
+    if not is_dry:
+        cache_updates, fetch_result_metrics = build_cache_updates(
+            valid_asins=valid_asins,
+            rows_seen=rows_seen,
+            fetched_keepa_data=fetched_keepa_data,
+            fetch_metrics=fetch_metrics,
+            existing_cache=cache_df,
+            coefficient=coefficient,
+            now=now,
+            attempted_asins=attempted_asins,
+        )
+        priority_by_asin = {d.asin: d.priority for d in queue_decisions}
+        for row in cache_updates:
+            row["fetch_priority"] = priority_by_asin.get(row["asin"], "low")
 
-    priority_by_asin = {d.asin: d.priority for d in queue_decisions}
-    for row in cache_updates:
-        row["fetch_priority"] = priority_by_asin.get(row["asin"], "low")
+        cache_df = merge_cache_records(cache_df, cache_updates)
+        save_cache(cache_df, settings["cache_path"])
+        refreshed_data, _ = build_keepa_data_from_cache(valid_asins=valid_asins, cache_df=cache_df)
+    else:
+        fetch_result_metrics = {"fetched_success_count": 0, "fetched_failure_count": 0}
+        refreshed_data = keepa_data
 
-    cache_df = merge_cache_records(cache_df, cache_updates)
-    save_cache(cache_df, settings["cache_path"])
-
-    refreshed_data, _ = build_keepa_data_from_cache(valid_asins=valid_asins, cache_df=cache_df)
-
-    # Output keeps all original rows, including missing-ASIN rows.
     enriched = enrich_dataframe(df=df, keepa_data=refreshed_data, coefficient=coefficient)
-    enriched.to_excel(settings["output_path"], index=False)
+    if not is_dry:
+        enriched.to_excel(settings["output_path"], index=False)
 
     queue_metrics = {
         "queued_for_fetch_count": len(queued_asins),
@@ -586,6 +846,18 @@ def main() -> None:
         "queue_priority_high_count": len([d for d in queue_decisions if d.queued and d.priority == "high"]),
         "queue_priority_medium_count": len([d for d in queue_decisions if d.queued and d.priority == "medium"]),
         "queue_priority_low_count": len([d for d in queue_decisions if not d.queued]),
+        "mode": args.mode,
+        "available_tokens_at_start": available_tokens_at_start,
+        "reserve_tokens": args.reserve_tokens,
+        "total_queue_count": len(queued_asins),
+        "selected_fetch_count": selected_fetch_count,
+        "remaining_queue_count": max(0, len(queued_asins) - selected_fetch_count),
+        "cycle_count": cycle_count,
+        "total_sleep_seconds": int(total_sleep_seconds),
+        "run_duration_seconds": int(time.time() - run_start),
+        "effective_tokens_per_minute": 0.0 if args.mode != "drip" else (selected_fetch_count / max((time.time()-run_start)/60.0, 1e-9)),
+        "max_minutes_reached": bool(max_minutes_reached),
+        "queue_exhausted": bool(queue_exhausted),
     }
 
     fetch_metrics.update(fetch_result_metrics)
@@ -594,7 +866,10 @@ def main() -> None:
 
     summary = build_summary(enriched, fetch_metrics, coefficient)
     log_and_print_summary(summary, logger)
-    logger.info("Saved output: %s", settings["output_path"])
+    if is_dry:
+        logger.info("Dry-run completed. API fetch and file outputs were skipped.")
+    else:
+        logger.info("Saved output: %s", settings["output_path"])
 
 
 if __name__ == "__main__":

@@ -9,3 +9,10 @@ asin_cache = asin_cache.csv
 [app]
 log_file = keepa_enrich.log
 timeout_sec = 30
+
+[run]
+default_mode = single
+reserve_tokens = 10
+tokens_per_minute = 5
+interval_seconds = 60
+max_minutes = 480
