@@ -31,23 +31,26 @@
 キュー選定の概要:
 - `queue_decision=new`: キャッシュ未登録
 - `queue_decision=retry`: 通信失敗・unavailable・主要データ欠損など
+- `queue_decision=retry_not_found_due`: `keepa_product_not_found` の cooldown 経過後
+- `queue_decision=skip_not_found_cooldown`: `keepa_product_not_found` で cooldown 中
 - `queue_decision=stale`: `next_fetch_after` 到来 or 古いデータ
 - `queue_decision=skip_cached`: キャッシュが新鮮で再取得不要
 
 `next_fetch_after` の初期ルール:
 - communication_error: 30分後
-- keepa_product_not_found: 7日後
+- keepa_product_not_found: 7日後（cooldown中は再試行しない）
 - monthlySold あり: 7日後
 - monthlySold なし / salesRankDrops30 あり: 3日後
 - 両方欠損: 2日後
 
 キャッシュを削除すると、次回実行時は全 ASIN が未取得扱いとなり、再フル取得できます。
+キャッシュ保存は一時ファイル（`.tmp`）へ書き込み後 `os.replace()` で切替える atomic 方式です。
 
 ## keepa_lastSoldUpdate の形式
 `keepa_lastSoldUpdate` は Excel 出力時に `YYYY-MM-DD HH:MM:SS` 形式の文字列です。
 
 - 値が無い場合は空欄
-- Keepa の minute 値や日時文字列を変換できる場合のみ整形
+- Keepa の minute 値や日時文字列を変換できる場合のみ整形（文字列日時が tz-aware の場合は Asia/Tokyo に変換後に整形）
 - 変換失敗時は warning をログ出力し、元値（文字列）または空欄で継続
 
 ## input/output ファイル名
@@ -101,7 +104,7 @@ APIキーの優先順:
 
 ### drip
 - 夜間の継続運用向けモードです。
-- `interval_seconds` ごとに token status を見ながら安全な件数だけ進めます。
+- `interval_seconds` ごとに token status を見ながら安全な件数だけ進め、各サイクルでその場で実 fetch とキャッシュ更新を行います。
 - 予算式: `target_tokens_this_cycle = tokens_per_minute * interval_seconds / 60`（整数化）
 - `available_tokens - reserve_tokens` を超えるときは自動で減速します。
 - トークン不足時は 0 件のループを許容し、待機とログを継続します。
@@ -156,6 +159,8 @@ dist\KeepaMonthlySales\
   config.ini         # config.ini.example をコピーして作成
   output.xlsx        # Amazon_Price_search の出力
 ```
+
+Keepa product API への問い合わせは最大100 ASIN単位でまとめて送信し、返却productsに存在しないASINは `keepa_product_not_found` としてASIN単位で扱います。
 
 ## ログ分類
 ログでは以下を区別します。

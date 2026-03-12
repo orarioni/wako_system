@@ -34,6 +34,7 @@ DEFAULT_MAX_MINUTES = 480
 DEFAULT_MAX_BATCH_SIZE = 100
 TOKEN_COST_PER_ASIN = 1
 KEEPA_EPOCH = datetime(2011, 1, 1, tzinfo=timezone.utc)
+TOKYO_TZ = timezone(timedelta(hours=9))
 
 ADDED_COLUMNS = [
     "keepa_title",
@@ -113,11 +114,46 @@ def format_keepa_last_sold_update(raw_value: Any, asin: str, logger: logging.Log
     if not text_value:
         return None
     try:
-        dt = pd.to_datetime(text_value, utc=True)
+        dt = pd.to_datetime(text_value)
     except Exception:  # noqa: BLE001
         logger.warning("ASIN=%s status=lastSoldUpdate_parse_error detail=unparseable_text", asin)
         return text_value
+    if getattr(dt, "tzinfo", None) is not None:
+        dt = dt.tz_convert(TOKYO_TZ).tz_localize(None)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fetch_keepa_products_batch(
+    asins: list[str],
+    api_key: str,
+    timeout_sec: int,
+    domain: int = DEFAULT_KEEPA_DOMAIN,
+) -> list[dict[str, Any]]:
+    url = "https://api.keepa.com/product"
+    params = {
+        "key": api_key,
+        "domain": domain,
+        "asin": ",".join(asins),
+        "stats": 180,
+        "history": 0,
+        "buybox": 0,
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=timeout_sec)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise KeepaCommunicationError(str(exc)) from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise KeepaCommunicationError(f"json_decode_error: {exc}") from exc
+
+    products = payload.get("products") or []
+    if not isinstance(products, list):
+        raise KeepaCommunicationError("products is not list")
+    return products
 
 
 def load_settings(base_dir: Path) -> dict[str, Any]:
@@ -171,28 +207,12 @@ def fetch_keepa_product(
     logger: logging.Logger,
     domain: int = DEFAULT_KEEPA_DOMAIN,
 ) -> dict[str, Any]:
-    url = "https://api.keepa.com/product"
-    params = {
-        "key": api_key,
-        "domain": domain,
-        "asin": asin,
-        "stats": 180,
-        "history": 0,
-        "buybox": 0,
-    }
-
-    try:
-        response = requests.get(url, params=params, timeout=timeout_sec)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as exc:
-        raise KeepaCommunicationError(str(exc)) from exc
-
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        raise KeepaCommunicationError(f"json_decode_error: {exc}") from exc
-
-    products = payload.get("products") or []
+    products = fetch_keepa_products_batch(
+        asins=[asin],
+        api_key=api_key,
+        timeout_sec=timeout_sec,
+        domain=domain,
+    )
     if not products:
         raise KeepaProductNotFoundError("products is empty")
 
@@ -218,6 +238,17 @@ def fetch_keepa_product(
     }
 
 
+def normalize_product_for_asin(product: dict[str, Any], asin: str, logger: logging.Logger) -> dict[str, Any]:
+    stats = product.get("stats") or {}
+    return {
+        "asin": product.get("asin") or asin,
+        "title": product.get("title"),
+        "monthlySold": product.get("monthlySold"),
+        "lastSoldUpdate": format_keepa_last_sold_update(product.get("lastSoldUpdate"), asin=asin, logger=logger),
+        "salesRankDrops30": stats.get("salesRankDrops30"),
+    }
+
+
 def collect_keepa_data(
     asins: list[str],
     api_key: str,
@@ -234,49 +265,51 @@ def collect_keepa_data(
         "failure_by_asin": {},
     }
 
-    for index, asin in enumerate(asins, start=1):
+    for batch_start in range(0, len(asins), DEFAULT_MAX_BATCH_SIZE):
+        batch_asins = asins[batch_start : batch_start + DEFAULT_MAX_BATCH_SIZE]
         try:
-            item = fetch_keepa_product(asin=asin, api_key=api_key, timeout_sec=timeout_sec, logger=logger)
-            data[asin] = item
-            logger.info("[%s/%s] Keepa fetched: %s", index, len(asins), asin)
+            products = fetch_keepa_products_batch(
+                asins=batch_asins,
+                api_key=api_key,
+                timeout_sec=timeout_sec,
+            )
+            products_by_asin = {normalize_asin(p.get("asin")).upper(): p for p in products}
 
-            if is_monthly_sold_missing(item.get("monthlySold")):
-                metrics["monthlySold_missing_count"] += 1
-                logger.info("ASIN=%s status=monthlySold_missing", asin)
-            if is_sales_rank_drops30_missing(item.get("salesRankDrops30")):
-                metrics["salesRankDrops30_missing_count"] += 1
-                logger.info("ASIN=%s status=salesRankDrops30_missing", asin)
+            for asin in batch_asins:
+                normalized = normalize_asin(asin).upper()
+                product = products_by_asin.get(normalized)
+                if product is None:
+                    metrics["keepa_product_not_found_count"] += 1
+                    metrics["failure_by_asin"][asin] = "keepa_product_not_found"
+                    logger.warning("ASIN=%s failure_type=keepa_product_not_found detail=requested ASIN not present in products", asin)
+                    continue
+
+                item = normalize_product_for_asin(product=product, asin=asin, logger=logger)
+                data[asin] = item
+                logger.info("Keepa fetched: %s", asin)
+
+                if is_monthly_sold_missing(item.get("monthlySold")):
+                    metrics["monthlySold_missing_count"] += 1
+                    logger.info("ASIN=%s status=monthlySold_missing", asin)
+                if is_sales_rank_drops30_missing(item.get("salesRankDrops30")):
+                    metrics["salesRankDrops30_missing_count"] += 1
+                    logger.info("ASIN=%s status=salesRankDrops30_missing", asin)
 
         except KeepaCommunicationError as exc:
-            metrics["communication_error_count"] += 1
-            metrics["failure_by_asin"][asin] = "communication_error"
-            logger.warning(
-                "[%s/%s] ASIN=%s failure_type=communication_error detail=%s",
-                index,
-                len(asins),
-                asin,
-                str(exc),
-            )
+            for asin in batch_asins:
+                metrics["communication_error_count"] += 1
+                metrics["failure_by_asin"][asin] = "communication_error"
+                logger.warning("ASIN=%s failure_type=communication_error detail=%s", asin, str(exc))
         except KeepaProductNotFoundError as exc:
-            metrics["keepa_product_not_found_count"] += 1
-            metrics["failure_by_asin"][asin] = "keepa_product_not_found"
-            logger.warning(
-                "[%s/%s] ASIN=%s failure_type=keepa_product_not_found detail=%s",
-                index,
-                len(asins),
-                asin,
-                str(exc),
-            )
+            for asin in batch_asins:
+                metrics["keepa_product_not_found_count"] += 1
+                metrics["failure_by_asin"][asin] = "keepa_product_not_found"
+                logger.warning("ASIN=%s failure_type=keepa_product_not_found detail=%s", asin, str(exc))
         except Exception as exc:  # noqa: BLE001
-            metrics["communication_error_count"] += 1
-            metrics["failure_by_asin"][asin] = "communication_error"
-            logger.warning(
-                "[%s/%s] ASIN=%s failure_type=communication_error detail=unexpected_error:%s",
-                index,
-                len(asins),
-                asin,
-                str(exc),
-            )
+            for asin in batch_asins:
+                metrics["communication_error_count"] += 1
+                metrics["failure_by_asin"][asin] = "communication_error"
+                logger.warning("ASIN=%s failure_type=communication_error detail=unexpected_error:%s", asin, str(exc))
 
     return data, metrics
 
@@ -746,6 +779,17 @@ def main() -> None:
     queued_asins = sort_queued_asins(queue_decisions)
     available_tokens_at_start = get_token_status(api_key=api_key, timeout_sec=settings["timeout_sec"], logger=logger) if args.mode in {"burst", "drip"} else 0
 
+    fetch_metrics: dict[str, Any] = {
+        "communication_error_count": 0,
+        "keepa_product_not_found_count": 0,
+        "monthlySold_missing_count": 0,
+        "salesRankDrops30_missing_count": 0,
+        "failure_by_asin": {},
+    }
+    fetched_keepa_data: dict[str, dict[str, Any]] = {}
+    attempted_asins: set[str] = set()
+    priority_by_asin = {d.asin: d.priority for d in queue_decisions}
+
     if args.mode == "single":
         selected_asins, selected_fetch_count, cycle_count, is_dry = run_single_mode(queued_asins, args.max_fetches, args.dry_run)
         total_sleep_seconds = 0.0
@@ -771,33 +815,91 @@ def main() -> None:
             len(queued_asins) - selected_fetch_count,
         )
     else:
-        selected_asins, selected_fetch_count, cycle_count, total_sleep_seconds, max_minutes_reached, queue_exhausted = run_drip_mode(
-            queued_asins=queued_asins,
-            reserve_tokens=args.reserve_tokens,
-            tokens_per_minute=args.tokens_per_minute,
-            interval_seconds=args.interval_seconds,
-            max_minutes=args.max_minutes,
-            max_fetches=args.max_fetches,
-            api_key=api_key,
-            timeout_sec=settings["timeout_sec"],
-            logger=logger,
-            dry_run=args.dry_run,
-        )
+        selected_asins = []
+        selected_fetch_count = 0
+        cycle_count = 0
+        total_sleep_seconds = 0.0
+        max_minutes_reached = False
+        queue_index = 0
+        drip_start = time.time()
+
+        while queue_index < len(queued_asins):
+            elapsed_minutes = (time.time() - drip_start) / 60.0
+            if elapsed_minutes >= args.max_minutes:
+                max_minutes_reached = True
+                break
+
+            cycle_count += 1
+            available_tokens = get_token_status(api_key=api_key, timeout_sec=settings["timeout_sec"], logger=logger)
+            remaining_queue = len(queued_asins) - queue_index
+            cycle_budget = compute_drip_budget(
+                available_tokens=available_tokens,
+                reserve_tokens=args.reserve_tokens,
+                tokens_per_minute=args.tokens_per_minute,
+                interval_seconds=args.interval_seconds,
+                queue_count=remaining_queue,
+                max_fetches=None if args.max_fetches is None else max(0, args.max_fetches - selected_fetch_count),
+            )
+            batch = select_fetch_batch(queued_asins[queue_index:], cycle_budget)
+            selected_fetch_count += len(batch)
+            selected_asins.extend(batch)
+
+            logger.info(
+                "mode=drip cycle=%s available_tokens=%s reserve_tokens=%s cycle_budget=%s selected_fetch_count=%s remaining_queue_count=%s sleep_seconds=%s",
+                cycle_count,
+                available_tokens,
+                args.reserve_tokens,
+                cycle_budget,
+                len(batch),
+                len(queued_asins) - queue_index - len(batch),
+                args.interval_seconds,
+            )
+
+            if not args.dry_run and batch:
+                attempted_asins.update(batch)
+                cycle_data, cycle_metrics = collect_keepa_data(
+                    asins=batch,
+                    api_key=api_key,
+                    timeout_sec=settings["timeout_sec"],
+                    logger=logger,
+                )
+                fetched_keepa_data.update(cycle_data)
+                fetch_metrics = merge_metrics(fetch_metrics, cycle_metrics)
+
+                cycle_keepa_for_coeff = {**build_keepa_data_from_cache(valid_asins=valid_asins, cache_df=cache_df)[0], **cycle_data}
+                cycle_coefficient = calculate_coefficient(cycle_keepa_for_coeff)
+                cycle_updates, _ = build_cache_updates(
+                    valid_asins=batch,
+                    rows_seen=rows_seen,
+                    fetched_keepa_data=cycle_data,
+                    fetch_metrics=cycle_metrics,
+                    existing_cache=cache_df,
+                    coefficient=cycle_coefficient,
+                    now=datetime.now(),
+                    attempted_asins=set(batch),
+                )
+                for row in cycle_updates:
+                    row["fetch_priority"] = priority_by_asin.get(row["asin"], "low")
+                cache_df = merge_cache_records(cache_df, cycle_updates)
+                save_cache(cache_df, settings["cache_path"], logger=logger)
+
+            queue_index += len(batch)
+            if queue_index >= len(queued_asins):
+                break
+            if args.max_fetches is not None and selected_fetch_count >= args.max_fetches:
+                break
+            if args.dry_run:
+                break
+
+            time.sleep(args.interval_seconds)
+            total_sleep_seconds += args.interval_seconds
+
+        queue_exhausted = queue_index >= len(queued_asins)
         is_dry = args.dry_run
 
     logger.info("mode=%s selected_fetch_count=%s total_queue_count=%s", args.mode, selected_fetch_count, len(queued_asins))
 
-    fetch_metrics: dict[str, Any] = {
-        "communication_error_count": 0,
-        "keepa_product_not_found_count": 0,
-        "monthlySold_missing_count": 0,
-        "salesRankDrops30_missing_count": 0,
-        "failure_by_asin": {},
-    }
-    fetched_keepa_data: dict[str, dict[str, Any]] = {}
-    attempted_asins: set[str] = set()
-
-    if not is_dry and selected_asins:
+    if args.mode in {"single", "burst"} and not is_dry and selected_asins:
         batches = [selected_asins[i:i + DEFAULT_MAX_BATCH_SIZE] for i in range(0, len(selected_asins), DEFAULT_MAX_BATCH_SIZE)]
         for batch in batches:
             attempted_asins.update(batch)
@@ -830,7 +932,7 @@ def main() -> None:
             row["fetch_priority"] = priority_by_asin.get(row["asin"], "low")
 
         cache_df = merge_cache_records(cache_df, cache_updates)
-        save_cache(cache_df, settings["cache_path"])
+        save_cache(cache_df, settings["cache_path"], logger=logger)
         refreshed_data, _ = build_keepa_data_from_cache(valid_asins=valid_asins, cache_df=cache_df)
     else:
         fetch_result_metrics = {"fetched_success_count": 0, "fetched_failure_count": 0}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import os
 from pathlib import Path
 from typing import Any
 
@@ -81,12 +82,22 @@ def load_cache(cache_path: Path) -> pd.DataFrame:
     return cache[CACHE_COLUMNS]
 
 
-def save_cache(cache: pd.DataFrame, cache_path: Path) -> None:
+def save_cache(cache: pd.DataFrame, cache_path: Path, logger: Any = None) -> None:
     ordered = cache.copy()
     for col in CACHE_COLUMNS:
         if col not in ordered.columns:
             ordered[col] = None
-    ordered[CACHE_COLUMNS].to_csv(cache_path, index=False, encoding="utf-8")
+
+    tmp_path = cache_path.with_name(f"{cache_path.name}.tmp")
+    try:
+        ordered[CACHE_COLUMNS].to_csv(tmp_path, index=False, encoding="utf-8")
+        os.replace(tmp_path, cache_path)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        if logger is not None:
+            logger.exception("cache_save_failed path=%s", cache_path)
+        raise
 
 
 def compute_next_fetch_after(now: datetime, failure_type: str | None, monthly_sold: Any, drops30: Any) -> datetime:
@@ -125,7 +136,12 @@ def decide_fetch_queue(valid_asins: list[str], rows_seen: dict[str, int], cache:
         last_fetched_at = parse_dt(row.get("last_fetched_at"))
         keepa_last_sold = parse_dt(row.get("keepa_lastSoldUpdate"))
 
-        if failure_type and failure_type != "keepa_product_not_found":
+        if failure_type == "keepa_product_not_found":
+            if next_fetch_after is not None and next_fetch_after <= now:
+                decisions.append(QueueDecision(asin=asin, queued=True, decision="retry_not_found_due", priority="high"))
+            else:
+                decisions.append(QueueDecision(asin=asin, queued=False, decision="skip_not_found_cooldown", priority="low"))
+        elif failure_type:
             decisions.append(QueueDecision(asin=asin, queued=True, decision="retry", priority="high"))
         elif estimate_source == "unavailable":
             decisions.append(QueueDecision(asin=asin, queued=True, decision="retry", priority="high"))

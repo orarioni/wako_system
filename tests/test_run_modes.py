@@ -53,6 +53,30 @@ class RunModeLogicTests(unittest.TestCase):
         self.assertEqual(cycle_count, 1)
         self.assertFalse(is_dry)
 
+    def test_drip_two_cycles_do_not_exceed_cycle_budget(self):
+        queued = [f"A{i}" for i in range(20)]
+        selected_total = []
+        queue_index = 0
+        for _ in range(2):
+            budget = compute_drip_budget(
+                available_tokens=100,
+                reserve_tokens=10,
+                tokens_per_minute=3,
+                interval_seconds=60,
+                queue_count=len(queued) - queue_index,
+                max_fetches=None,
+            )
+            batch = select_fetch_batch(queued[queue_index:], budget=budget)
+            self.assertLessEqual(len(batch), 3)
+            selected_total.extend(batch)
+            queue_index += len(batch)
+        self.assertEqual(len(selected_total), 6)
+
+    def test_budget_zero_selects_no_fetch(self):
+        queued = ["A1", "A2"]
+        batch = select_fetch_batch(queued, budget=0)
+        self.assertEqual(batch, [])
+
 
 if __name__ == "__main__":
     unittest.main()
