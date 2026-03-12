@@ -5,7 +5,8 @@
 
 主な仕様:
 - **元の全行を保持**して出力（ASIN 空欄行も削除しない）
-- API 呼び出し対象は **ASIN がある行のユニーク ASIN のみ**
+- 差分更新キューにより、Keepa API 呼び出し対象は **今回取得が必要な ASIN のみ**
+- 今回取得しない ASIN でも、ローカルキャッシュ（`asin_cache.csv`）の過去データを出力に反映
 - ASIN 空欄行は推定不可として以下を設定
   - `estimate_source = unavailable`
   - `estimate_confidence = D`
@@ -16,6 +17,31 @@
 - 補正係数は `monthlySold >= 1` かつ `salesRankDrops30 >= 1` の `monthlySold / salesRankDrops30` の中央値
 - 係数が算出できない場合は `1.0`
 - 一部 ASIN で API 失敗があっても全体処理は継続
+
+
+## 差分更新キューとキャッシュ
+`asin_cache.csv` に ASIN ごとの取得状態を保存し、毎回の実行で差分更新キューを組み立てます。
+
+キャッシュには以下を保持します（主要項目）:
+- `asin`, `last_fetched_at`, `last_success_at`, `last_failure_at`
+- `keepa_lastSoldUpdate`, `keepa_monthlySold`, `keepa_salesRankDrops30`
+- `estimate_source`, `estimate_confidence`, `estimate_note`
+- `failure_type`, `rows_seen_in_input`, `fetch_priority`, `next_fetch_after`, `consecutive_failures`
+
+キュー選定の概要:
+- `queue_decision=new`: キャッシュ未登録
+- `queue_decision=retry`: 通信失敗・unavailable・主要データ欠損など
+- `queue_decision=stale`: `next_fetch_after` 到来 or 古いデータ
+- `queue_decision=skip_cached`: キャッシュが新鮮で再取得不要
+
+`next_fetch_after` の初期ルール:
+- communication_error: 30分後
+- keepa_product_not_found: 7日後
+- monthlySold あり: 7日後
+- monthlySold なし / salesRankDrops30 あり: 3日後
+- 両方欠損: 2日後
+
+キャッシュを削除すると、次回実行時は全 ASIN が未取得扱いとなり、再フル取得できます。
 
 ## keepa_lastSoldUpdate の形式
 `keepa_lastSoldUpdate` は Excel 出力時に `YYYY-MM-DD HH:MM:SS` 形式の文字列です。
@@ -42,6 +68,7 @@ api_key =
 [files]
 input_excel = output.xlsx
 output_excel = output_keepa.xlsx
+asin_cache = asin_cache.csv
 
 [app]
 log_file = keepa_enrich.log
@@ -105,6 +132,15 @@ dist\KeepaMonthlySales\
 - `rows_with_missing_asin`
 - `rows_with_valid_asin`
 - `unique_valid_asins`
+- `queued_for_fetch_count`
+- `skipped_by_cache_count`
+- `fetched_success_count`
+- `fetched_failure_count`
+- `cache_hit_count`
+- `cache_miss_count`
+- `queue_priority_high_count`
+- `queue_priority_medium_count`
+- `queue_priority_low_count`
 - `monthlySold_used_count`
 - `salesRankDrops30_calibrated_count`
 - `unavailable_count`

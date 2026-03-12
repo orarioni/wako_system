@@ -4,6 +4,7 @@ api_key =
 [files]
 input_excel = output.xlsx
 output_excel = output_keepa.xlsx
+asin_cache = asin_cache.csv
 
 [app]
 log_file = keepa_enrich.log

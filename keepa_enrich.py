@@ -10,11 +10,20 @@ from typing import Any
 import pandas as pd
 import requests
 
+from update_queue import (
+    compute_next_fetch_after,
+    decide_fetch_queue,
+    load_cache,
+    merge_cache_records,
+    save_cache,
+)
+
 DEFAULT_KEEPA_DOMAIN = 5  # Amazon.co.jp
 DEFAULT_TIMEOUT_SEC = 30
 DEFAULT_INPUT_FILE = "output.xlsx"
 DEFAULT_OUTPUT_FILE = "output_keepa.xlsx"
 DEFAULT_LOG_FILE = "keepa_enrich.log"
+DEFAULT_CACHE_FILE = "asin_cache.csv"
 KEEPA_EPOCH = datetime(2011, 1, 1, tzinfo=timezone.utc)
 
 ADDED_COLUMNS = [
@@ -28,6 +37,7 @@ ADDED_COLUMNS = [
     "estimate_confidence",
     "estimate_note",
 ]
+
 
 
 class KeepaCommunicationError(Exception):
@@ -112,6 +122,7 @@ def load_settings(base_dir: Path) -> dict[str, Any]:
         "input_excel": config.get("files", "input_excel", fallback=DEFAULT_INPUT_FILE).strip() or DEFAULT_INPUT_FILE,
         "output_excel": config.get("files", "output_excel", fallback=DEFAULT_OUTPUT_FILE).strip() or DEFAULT_OUTPUT_FILE,
         "log_file": config.get("app", "log_file", fallback=DEFAULT_LOG_FILE).strip() or DEFAULT_LOG_FILE,
+        "cache_file": config.get("files", "asin_cache", fallback=DEFAULT_CACHE_FILE).strip() or DEFAULT_CACHE_FILE,
         "timeout_sec": config.getint("app", "timeout_sec", fallback=DEFAULT_TIMEOUT_SEC),
     }
 
@@ -119,6 +130,7 @@ def load_settings(base_dir: Path) -> dict[str, Any]:
     settings["output_path"] = (base_dir / settings["output_excel"]).resolve()
     settings["log_path"] = (base_dir / settings["log_file"]).resolve()
     settings["config_path"] = config_path
+    settings["cache_path"] = (base_dir / settings["cache_file"]).resolve()
     return settings
 
 
@@ -197,7 +209,7 @@ def collect_keepa_data(
     api_key: str,
     timeout_sec: int,
     logger: logging.Logger,
-) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """Fetch Keepa data by unique ASIN. Keep processing even if a subset fails."""
     data: dict[str, dict[str, Any]] = {}
     metrics = {
@@ -205,6 +217,7 @@ def collect_keepa_data(
         "keepa_product_not_found_count": 0,
         "monthlySold_missing_count": 0,
         "salesRankDrops30_missing_count": 0,
+        "failure_by_asin": {},
     }
 
     for index, asin in enumerate(asins, start=1):
@@ -222,6 +235,7 @@ def collect_keepa_data(
 
         except KeepaCommunicationError as exc:
             metrics["communication_error_count"] += 1
+            metrics["failure_by_asin"][asin] = "communication_error"
             logger.warning(
                 "[%s/%s] ASIN=%s failure_type=communication_error detail=%s",
                 index,
@@ -231,6 +245,7 @@ def collect_keepa_data(
             )
         except KeepaProductNotFoundError as exc:
             metrics["keepa_product_not_found_count"] += 1
+            metrics["failure_by_asin"][asin] = "keepa_product_not_found"
             logger.warning(
                 "[%s/%s] ASIN=%s failure_type=keepa_product_not_found detail=%s",
                 index,
@@ -240,6 +255,7 @@ def collect_keepa_data(
             )
         except Exception as exc:  # noqa: BLE001
             metrics["communication_error_count"] += 1
+            metrics["failure_by_asin"][asin] = "communication_error"
             logger.warning(
                 "[%s/%s] ASIN=%s failure_type=communication_error detail=unexpected_error:%s",
                 index,
@@ -342,6 +358,117 @@ def enrich_dataframe(df: pd.DataFrame, keepa_data: dict[str, dict[str, Any]], co
     return df
 
 
+def keepa_row_from_cache(cache_row: pd.Series | None) -> dict[str, Any] | None:
+    if cache_row is None:
+        return None
+    return {
+        "title": cache_row.get("keepa_title"),
+        "monthlySold": cache_row.get("keepa_monthlySold"),
+        "lastSoldUpdate": cache_row.get("keepa_lastSoldUpdate"),
+        "salesRankDrops30": cache_row.get("keepa_salesRankDrops30"),
+    }
+
+
+def build_keepa_data_from_cache(valid_asins: list[str], cache_df: pd.DataFrame) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    keepa_data: dict[str, dict[str, Any]] = {}
+    cache_hit = 0
+    cache_idx = cache_df.set_index("asin", drop=False) if not cache_df.empty else pd.DataFrame(columns=["asin"]).set_index("asin", drop=False)
+
+    for asin in valid_asins:
+        if asin in cache_idx.index:
+            keepa_info = keepa_row_from_cache(cache_idx.loc[asin])
+            if keepa_info is not None:
+                keepa_data[asin] = keepa_info
+                cache_hit += 1
+
+    return keepa_data, {"cache_hit_count": cache_hit, "cache_miss_count": len(valid_asins) - cache_hit}
+
+
+def build_cache_updates(
+    valid_asins: list[str],
+    rows_seen: dict[str, int],
+    fetched_keepa_data: dict[str, dict[str, Any]],
+    fetch_metrics: dict[str, int],
+    existing_cache: pd.DataFrame,
+    coefficient: float,
+    now: datetime,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    cache_idx = existing_cache.set_index("asin", drop=False) if not existing_cache.empty else pd.DataFrame(columns=["asin"]).set_index("asin", drop=False)
+    failure_by_asin = fetch_metrics.get("failure_by_asin", {})
+    updates: list[dict[str, Any]] = []
+
+    fetched_success_count = 0
+    fetched_failure_count = 0
+
+    for asin in valid_asins:
+        old = cache_idx.loc[asin] if asin in cache_idx.index else None
+        failure_type = failure_by_asin.get(asin)
+
+        if asin in fetched_keepa_data:
+            keepa_info = fetched_keepa_data[asin]
+            est = build_estimation(asin, keepa_info, coefficient)
+            fetched_success_count += 1
+            consecutive_failures = 0
+            last_success_at = now.strftime("%Y-%m-%d %H:%M:%S")
+            last_failure_at = old.get("last_failure_at") if old is not None else None
+        else:
+            if failure_type:
+                fetched_failure_count += 1
+                if old is not None:
+                    keepa_info = keepa_row_from_cache(old)
+                    est = build_estimation(asin, keepa_info, coefficient)
+                    if est["estimate_source"] == "unavailable":
+                        est["estimate_note"] = "Keepa data unavailable"
+                else:
+                    est = build_estimation(asin, None, coefficient)
+                previous_failures = int(safe_float(old.get("consecutive_failures")) or 0) if old is not None else 0
+                consecutive_failures = previous_failures + 1
+                last_success_at = old.get("last_success_at") if old is not None else None
+                last_failure_at = now.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                if old is None:
+                    continue
+                keepa_info = keepa_row_from_cache(old)
+                est = build_estimation(asin, keepa_info, coefficient)
+                failure_type = old.get("failure_type")
+                consecutive_failures = int(safe_float(old.get("consecutive_failures")) or 0)
+                last_success_at = old.get("last_success_at")
+                last_failure_at = old.get("last_failure_at")
+
+        next_fetch_after = compute_next_fetch_after(
+            now=now,
+            failure_type=failure_type,
+            monthly_sold=est["keepa_monthlySold"],
+            drops30=est["keepa_salesRankDrops30"],
+        )
+
+        updates.append(
+            {
+                "asin": asin,
+                "last_fetched_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "last_success_at": last_success_at,
+                "last_failure_at": last_failure_at,
+                "keepa_title": est["keepa_title"],
+                "keepa_lastSoldUpdate": est["keepa_lastSoldUpdate"],
+                "keepa_monthlySold": est["keepa_monthlySold"],
+                "keepa_salesRankDrops30": est["keepa_salesRankDrops30"],
+                "estimate_source": est["estimate_source"],
+                "estimate_confidence": est["estimate_confidence"],
+                "estimate_note": est["estimate_note"],
+                "failure_type": failure_type,
+                "rows_seen_in_input": rows_seen.get(asin, 0),
+                "fetch_priority": None,
+                "next_fetch_after": next_fetch_after.strftime("%Y-%m-%d %H:%M:%S"),
+                "consecutive_failures": consecutive_failures,
+            }
+        )
+
+    return updates, {
+        "fetched_success_count": fetched_success_count,
+        "fetched_failure_count": fetched_failure_count,
+    }
+
+
 def build_summary(df: pd.DataFrame, metrics: dict[str, int], coefficient: float) -> dict[str, Any]:
     asin_series = df["ASIN"].apply(normalize_asin)
     rows_with_missing_asin = int((asin_series == "").sum())
@@ -353,6 +480,15 @@ def build_summary(df: pd.DataFrame, metrics: dict[str, int], coefficient: float)
         "rows_with_missing_asin": rows_with_missing_asin,
         "rows_with_valid_asin": rows_with_valid_asin,
         "unique_valid_asins": int(asin_series[asin_series != ""].nunique()),
+        "queued_for_fetch_count": int(metrics.get("queued_for_fetch_count", 0)),
+        "skipped_by_cache_count": int(metrics.get("skipped_by_cache_count", 0)),
+        "fetched_success_count": int(metrics.get("fetched_success_count", 0)),
+        "fetched_failure_count": int(metrics.get("fetched_failure_count", 0)),
+        "cache_hit_count": int(metrics.get("cache_hit_count", 0)),
+        "cache_miss_count": int(metrics.get("cache_miss_count", 0)),
+        "queue_priority_high_count": int(metrics.get("queue_priority_high_count", 0)),
+        "queue_priority_medium_count": int(metrics.get("queue_priority_medium_count", 0)),
+        "queue_priority_low_count": int(metrics.get("queue_priority_low_count", 0)),
         "monthlySold_used_count": int(estimate_source_counts.get("monthlySold", 0)),
         "salesRankDrops30_calibrated_count": int(estimate_source_counts.get("salesRankDrops30_calibrated", 0)),
         "unavailable_count": int(estimate_source_counts.get("unavailable", 0)),
@@ -386,6 +522,7 @@ def main() -> None:
     logger.info("Using config file: %s", settings["config_path"])
     logger.info("Input Excel: %s", settings["input_path"])
     logger.info("Output Excel: %s", settings["output_path"])
+    logger.info("ASIN cache: %s", settings["cache_path"])
 
     if not settings["input_path"].exists():
         raise FileNotFoundError(f"入力ファイルが見つかりません: {settings['input_path']}")
@@ -394,23 +531,68 @@ def main() -> None:
     if "ASIN" not in df.columns:
         raise ValueError("入力ファイルに ASIN 列が存在しません。")
 
-    # API request targets: unique + non-empty ASIN only.
-    asins = df["ASIN"].apply(normalize_asin).loc[lambda s: s != ""].drop_duplicates().tolist()
-    logger.info("Unique ASIN count for API fetch: %s", len(asins))
+    asin_series = df["ASIN"].apply(normalize_asin)
+    valid_asins = asin_series.loc[lambda s: s != ""].drop_duplicates().tolist()
+    rows_seen = asin_series[asin_series != ""].value_counts().to_dict()
+    now = datetime.now()
 
-    keepa_data, metrics = collect_keepa_data(
-        asins=asins,
+    cache_df = load_cache(settings["cache_path"])
+    queue_decisions = decide_fetch_queue(valid_asins=valid_asins, rows_seen=rows_seen, cache=cache_df, now=now)
+    queued_asins = [d.asin for d in queue_decisions if d.queued]
+
+    for decision in queue_decisions:
+        logger.info("ASIN=%s queue_decision=%s fetch_priority=%s", decision.asin, decision.decision, decision.priority)
+
+    logger.info("Unique valid ASIN count: %s", len(valid_asins))
+    logger.info("Queued ASIN count for API fetch: %s", len(queued_asins))
+
+    fetched_keepa_data, fetch_metrics = collect_keepa_data(
+        asins=queued_asins,
         api_key=api_key,
         timeout_sec=settings["timeout_sec"],
         logger=logger,
     )
+    keepa_data_from_cache, cache_metrics = build_keepa_data_from_cache(valid_asins=valid_asins, cache_df=cache_df)
+    keepa_data = {**keepa_data_from_cache, **fetched_keepa_data}
+
     coefficient = calculate_coefficient(keepa_data)
 
+    cache_updates, fetch_result_metrics = build_cache_updates(
+        valid_asins=valid_asins,
+        rows_seen=rows_seen,
+        fetched_keepa_data=fetched_keepa_data,
+        fetch_metrics=fetch_metrics,
+        existing_cache=cache_df,
+        coefficient=coefficient,
+        now=now,
+    )
+
+    priority_by_asin = {d.asin: d.priority for d in queue_decisions}
+    for row in cache_updates:
+        row["fetch_priority"] = priority_by_asin.get(row["asin"], "low")
+
+    cache_df = merge_cache_records(cache_df, cache_updates)
+    save_cache(cache_df, settings["cache_path"])
+
+    refreshed_data, _ = build_keepa_data_from_cache(valid_asins=valid_asins, cache_df=cache_df)
+
     # Output keeps all original rows, including missing-ASIN rows.
-    enriched = enrich_dataframe(df=df, keepa_data=keepa_data, coefficient=coefficient)
+    enriched = enrich_dataframe(df=df, keepa_data=refreshed_data, coefficient=coefficient)
     enriched.to_excel(settings["output_path"], index=False)
 
-    summary = build_summary(enriched, metrics, coefficient)
+    queue_metrics = {
+        "queued_for_fetch_count": len(queued_asins),
+        "skipped_by_cache_count": len(valid_asins) - len(queued_asins),
+        "queue_priority_high_count": len([d for d in queue_decisions if d.queued and d.priority == "high"]),
+        "queue_priority_medium_count": len([d for d in queue_decisions if d.queued and d.priority == "medium"]),
+        "queue_priority_low_count": len([d for d in queue_decisions if not d.queued]),
+    }
+
+    fetch_metrics.update(fetch_result_metrics)
+    fetch_metrics.update(cache_metrics)
+    fetch_metrics.update(queue_metrics)
+
+    summary = build_summary(enriched, fetch_metrics, coefficient)
     log_and_print_summary(summary, logger)
     logger.info("Saved output: %s", settings["output_path"])
 
