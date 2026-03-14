@@ -171,6 +171,16 @@ python keepa_enrich.py --mode drip --tokens-per-minute 5 --interval-seconds 60 -
 python keepa_enrich.py --mode burst --dry-run
 ```
 
+### 開発用 bat（ローカル Python 実行）
+開発用の `.bat` は `keepa_enrich.py` と同じフォルダに置いて使います。
+PowerShell からは `./run_single_dev.bat` のように **.bat を直接実行**してください（`python .\run_single_dev.bat` は不可）。
+
+- `run_single_dev.bat`（single）
+- `run_burst_dev.bat`（burst）
+- `run_drip_dev.bat`（drip）
+
+各 `.bat` は `cd /d "%~dp0"` 実行後、`.venv\Scripts\python.exe` があれば優先し、なければ `python` コマンドで起動します。
+
 ### 実行ファイル（配布先）
 配布先では **cmd.exe 用バッチ** を使って起動してください（ダブルクリック実行可）。
 `KeepaMonthlySales.exe` と同じフォルダに以下を置く前提です。
