@@ -62,6 +62,24 @@ class KeepaProductNotFoundError(Exception):
     """Raised when Keepa returns no product for the requested ASIN."""
 
 
+class SafeStreamHandler(logging.StreamHandler):
+    """Stream handler that tolerates broken console streams on Windows/PowerShell."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            super().emit(record)
+        except (OSError, ValueError):
+            # Keep business processing alive even if console output is broken.
+            return
+
+    def flush(self) -> None:
+        try:
+            super().flush()
+        except (OSError, ValueError):
+            # Keep business processing alive even if console output is broken.
+            return
+
+
 def get_base_dir() -> Path:
     """Resolve the directory of script/executable for portable file handling."""
     if getattr(sys, "frozen", False):
@@ -227,15 +245,21 @@ def configure_logging(log_path: Path) -> logging.Logger:
     logger = logging.getLogger("keepa_enrich")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
+    logger.propagate = False
 
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-
     logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
+
+    try:
+        stream_handler = SafeStreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+    except Exception:  # noqa: BLE001
+        # File logging remains active even if console handler setup fails.
+        pass
+
     return logger
 
 
