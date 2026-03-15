@@ -11,6 +11,8 @@ from typing import Any
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from update_queue import (
     DEFAULT_REFRESH_POLICY,
@@ -23,6 +25,8 @@ from update_queue import (
 
 DEFAULT_KEEPA_DOMAIN = 5  # Amazon.co.jp
 DEFAULT_TIMEOUT_SEC = 30
+DEFAULT_CONNECT_TIMEOUT_SEC = 10
+DEFAULT_READ_TIMEOUT_SEC = 60
 DEFAULT_INPUT_FILE = "output.xlsx"
 DEFAULT_OUTPUT_FILE = "output_keepa.xlsx"
 DEFAULT_LOG_FILE = "keepa_enrich.log"
@@ -37,6 +41,12 @@ DEFAULT_MAX_ZERO_BUDGET_CYCLES = 3
 DEFAULT_MAX_TOKEN_STATUS_FAILURES = 3
 DEFAULT_MAX_BATCH_SIZE = 100
 TOKEN_COST_PER_ASIN = 1
+DEFAULT_RETRY_TOTAL = 3
+DEFAULT_RETRY_CONNECT = 3
+DEFAULT_RETRY_READ = 3
+DEFAULT_RETRY_STATUS = 3
+DEFAULT_RETRY_BACKOFF_FACTOR = 1.0
+RETRY_STATUS_FORCE_LIST = (429, 500, 502, 503, 504)
 KEEPA_EPOCH = datetime(2011, 1, 1, tzinfo=timezone.utc)
 TOKYO_TZ = timezone(timedelta(hours=9))
 
@@ -145,11 +155,32 @@ def format_keepa_last_sold_update(raw_value: Any, asin: str, logger: logging.Log
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def build_requests_session() -> requests.Session:
+    retry = Retry(
+        total=DEFAULT_RETRY_TOTAL,
+        connect=DEFAULT_RETRY_CONNECT,
+        read=DEFAULT_RETRY_READ,
+        status=DEFAULT_RETRY_STATUS,
+        backoff_factor=DEFAULT_RETRY_BACKOFF_FACTOR,
+        status_forcelist=RETRY_STATUS_FORCE_LIST,
+        allowed_methods=frozenset(["GET"]),
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 def fetch_keepa_products_batch(
     asins: list[str],
     api_key: str,
-    timeout_sec: int,
+    session: requests.Session,
+    connect_timeout_sec: int = DEFAULT_CONNECT_TIMEOUT_SEC,
+    read_timeout_sec: int = DEFAULT_READ_TIMEOUT_SEC,
     domain: int = DEFAULT_KEEPA_DOMAIN,
+    logger: logging.Logger | None = None,
 ) -> list[dict[str, Any]]:
     url = "https://api.keepa.com/product"
     params = {
@@ -161,9 +192,21 @@ def fetch_keepa_products_batch(
         "buybox": 0,
     }
 
+    if logger is not None:
+        logger.info(
+            "keepa_request batch_size=%s connect_timeout=%s read_timeout=%s retry_total=%s retry_statuses=%s",
+            len(asins),
+            connect_timeout_sec,
+            read_timeout_sec,
+            DEFAULT_RETRY_TOTAL,
+            ",".join(str(code) for code in RETRY_STATUS_FORCE_LIST),
+        )
+
     try:
-        response = requests.get(url, params=params, timeout=timeout_sec)
+        response = session.get(url, params=params, timeout=(connect_timeout_sec, read_timeout_sec))
         response.raise_for_status()
+    except requests.exceptions.Timeout as exc:
+        raise KeepaCommunicationError(f"timeout_error: {exc}") from exc
     except requests.exceptions.RequestException as exc:
         raise KeepaCommunicationError(str(exc)) from exc
 
@@ -266,15 +309,20 @@ def configure_logging(log_path: Path) -> logging.Logger:
 def fetch_keepa_product(
     asin: str,
     api_key: str,
-    timeout_sec: int,
+    session: requests.Session,
     logger: logging.Logger,
+    connect_timeout_sec: int = DEFAULT_CONNECT_TIMEOUT_SEC,
+    read_timeout_sec: int = DEFAULT_READ_TIMEOUT_SEC,
     domain: int = DEFAULT_KEEPA_DOMAIN,
 ) -> dict[str, Any]:
     products = fetch_keepa_products_batch(
         asins=[asin],
         api_key=api_key,
-        timeout_sec=timeout_sec,
+        session=session,
+        connect_timeout_sec=connect_timeout_sec,
+        read_timeout_sec=read_timeout_sec,
         domain=domain,
+        logger=logger,
     )
     if not products:
         raise KeepaProductNotFoundError("products is empty")
@@ -315,8 +363,10 @@ def normalize_product_for_asin(product: dict[str, Any], asin: str, logger: loggi
 def collect_keepa_data(
     asins: list[str],
     api_key: str,
-    timeout_sec: int,
+    session: requests.Session,
     logger: logging.Logger,
+    connect_timeout_sec: int = DEFAULT_CONNECT_TIMEOUT_SEC,
+    read_timeout_sec: int = DEFAULT_READ_TIMEOUT_SEC,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """Fetch Keepa data by unique ASIN. Keep processing even if a subset fails."""
     data: dict[str, dict[str, Any]] = {}
@@ -334,7 +384,10 @@ def collect_keepa_data(
             products = fetch_keepa_products_batch(
                 asins=batch_asins,
                 api_key=api_key,
-                timeout_sec=timeout_sec,
+                session=session,
+                connect_timeout_sec=connect_timeout_sec,
+                read_timeout_sec=read_timeout_sec,
+                logger=logger,
             )
             products_by_asin = {normalize_asin(p.get("asin")).upper(): p for p in products}
 
@@ -857,6 +910,7 @@ def main() -> None:
     settings = load_settings(base_dir)
     args = parse_args(settings)
     logger = configure_logging(settings["log_path"])
+    session = build_requests_session()
 
     api_key = settings["api_key"] or os.getenv("KEEPA_API_KEY", "").strip()
     if not api_key:
@@ -1057,8 +1111,10 @@ def main() -> None:
                 cycle_data, cycle_metrics = collect_keepa_data(
                     asins=batch,
                     api_key=api_key,
-                    timeout_sec=settings["timeout_sec"],
+                    session=session,
                     logger=logger,
+                    connect_timeout_sec=DEFAULT_CONNECT_TIMEOUT_SEC,
+                    read_timeout_sec=DEFAULT_READ_TIMEOUT_SEC,
                 )
                 fetched_keepa_data.update(cycle_data)
                 fetch_metrics = merge_metrics(fetch_metrics, cycle_metrics)
@@ -1119,8 +1175,10 @@ def main() -> None:
             batch_data, batch_metrics = collect_keepa_data(
                 asins=batch,
                 api_key=api_key,
-                timeout_sec=settings["timeout_sec"],
+                session=session,
                 logger=logger,
+                connect_timeout_sec=DEFAULT_CONNECT_TIMEOUT_SEC,
+                read_timeout_sec=DEFAULT_READ_TIMEOUT_SEC,
             )
             fetched_keepa_data.update(batch_data)
             fetch_metrics = merge_metrics(fetch_metrics, batch_metrics)
